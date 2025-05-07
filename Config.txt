@@ -1,0 +1,7 @@
+{
+    "record_start_hotkey": "F9",
+    "record_stop_hotkey": "F10",
+    "play_start_hotkey": "F11",
+    "play_stop_hotkey": "F12",
+    "initial_delay": 0.0
+}

@@ -1,0 +1,8 @@
+{
+    "record_start_hotkey": "F9",
+    "record_stop_hotkey": "F10",
+    "play_start_hotkey": "F8",
+    "play_stop_hotkey": "F12",
+    "auto_reset_time": 130,
+    "mouse_sensitivity": 10.0
+}
