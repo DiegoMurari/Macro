@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
-# minecraft_macro_tool.py
-
 import os
+import subprocess
 import sys
 import time
 import json
@@ -11,8 +9,6 @@ import ctypes
 from ctypes import byref, sizeof, wintypes, c_uint
 from pynput import mouse
 from pynput.mouse import Controller, Button
-import tkinter as tk
-from tkinter import ttk, filedialog
 
 # parameters from config.json will still be loaded, but GUI is skipped in autoplay:
 AUTO_LOOP = "--autoplay" in sys.argv
@@ -20,7 +16,8 @@ AUTO_LOOP = "--autoplay" in sys.argv
 def _do_exec_autoplay():
     python = sys.executable
     script = os.path.abspath(sys.argv[0])
-    os.execv(python, [python, script, "--autoplay"])
+    args = [f'"{python}"', f'"{script}"', "--autoplay"]
+    os.execv(python, args)
 
 # WinAPI for playback
 user32   = ctypes.windll.user32
@@ -56,11 +53,12 @@ class RawInputRecorder:
         print("[RawInput] Listener pynput iniciado", flush=True)
 
     def stop(self):
-        if self._listener:
-            self._listener.stop()
-            self._listener = None
-            self._last_pos = None
-            print("[RawInput] Listener pynput parado", flush=True)
+        if not self._listener:
+            return
+        self._listener.stop()
+        self._listener = None
+        self._last_pos = None
+        print("[RawInput] Listener pynput parado", flush=True)
 
 # -- Globals ------------------------------------------------------------------
 events            = []
@@ -124,7 +122,6 @@ def init_segment_timer(update_callback=None):
             if update_callback:
                 update_callback(rem)
             time.sleep(1)
-
     threading.Thread(target=countdown, daemon=True).start()
 
 def save_macro():
@@ -178,6 +175,7 @@ def stop_record():
 # -- Macro Loading -----------------------------------------------------------
 def load_macro_file():
     global loaded_macro_file
+    from tkinter import filedialog  # import só quando GUI existir
     fname = filedialog.askopenfilename(
         initialdir=os.getcwd(),
         title="Selecione um macro (.json)",
@@ -202,8 +200,7 @@ def _periodic_actions():
 
 # -- Playback -----------------------------------------------------------------
 def _play_thread(macro_events):
-    global playing
-    keyboard.block_key('esc')
+    keyboard.block_key('esc')  # evita ESC tirando foco
 
     record_start = macro_events[0]["time"]
     play_start   = time.time()
@@ -212,23 +209,26 @@ def _play_thread(macro_events):
     for e in macro_events:
         if not playing:
             break
-        wait = (play_start + (e["time"] - record_start)) - time.time()
+        rel    = e["time"] - record_start
+        target = play_start + rel
+        wait   = target - time.time()
         if wait > 0:
             time.sleep(wait)
         if e["type"] == "mouse":
-            user32.mouse_event(0x0001, int(e["dx"]), -int(e["dy"]), 0, 0)
+            dx, dy = int(e["dx"]), -int(e["dy"])
+            user32.mouse_event(0x0001, dx, dy, 0, 0)
         else:
-            if e["event_type"] == "down":
-                keyboard.press(e["scan_code"])
+            et, sc = e["event_type"], e["scan_code"]
+            if et == "down":
+                keyboard.press(sc)
             else:
-                keyboard.release(e["scan_code"])
+                keyboard.release(sc)
 
     print("Reprodução concluída.", flush=True)
     keyboard.send("t"); time.sleep(0.1)
     keyboard.write("/mina reset"); keyboard.send("enter")
     time.sleep(0.1)
-    keyboard.unblock_key('esc')
-    playing = False
+    keyboard.unblock_key('esc')  # restaura ESC
     _do_exec_autoplay()
 
 def play_macro():
@@ -254,16 +254,29 @@ def stop_play():
     global playing
     if playing:
         playing = False
-        print("Reprodução parada pelo usuário.", flush=True)
+        # diagnóstico
+        print("[DEBUG] stop_play() chamado – parando macro e fechando VSCode...", flush=True)
 
-# ─── Registra hotkeys SEMPRE ─────────────────────────────────────────────────
-keyboard.add_hotkey(config["record_start_hotkey"], lambda: start_record(lambda r: None))
-keyboard.add_hotkey(config["record_stop_hotkey"],  stop_record)
-keyboard.add_hotkey(config["play_start_hotkey"],   play_macro)
-keyboard.add_hotkey(config["play_stop_hotkey"],    stop_play)
+        # tenta fechar o VSCode (inclui /T para processos filhos)
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/IM", "Code.exe"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print("[DEBUG] taskkill executado com sucesso.", flush=True)
+        except subprocess.CalledProcessError as e:
+            print(f"[DEBUG] taskkill falhou: {e}", flush=True)
 
-# ─── GUI (só se não for autoplay) ────────────────────────────────────────────
+        # sai deste script
+        sys.exit(0)
+
+
+# -- GUI (só se não for autoplay) -------------------------------------------
 if not AUTO_LOOP:
+    import tkinter as tk
+    from tkinter import ttk
     root = tk.Tk()
     root.title("Minecraft Macro Tool")
     root.resizable(False, False)
@@ -271,23 +284,35 @@ if not AUTO_LOOP:
     frame = ttk.Frame(root, padding=10)
     frame.grid()
 
-    ttk.Button(frame, text="Iniciar Gravação", command=lambda: start_record(update_label)).grid(row=0, column=0, padx=5, pady=5)
-    ttk.Button(frame, text="Parar Gravação",  command=stop_record).grid(row=0, column=1, padx=5, pady=5)
-    ttk.Button(frame, text="Carregar Macro",  command=load_macro_file).grid(row=1, column=0, padx=5, pady=5)
-    ttk.Button(frame, text="Iniciar Reprodução", command=play_macro).grid(row=1, column=1, padx=5, pady=5)
-    ttk.Button(frame, text="Parar Reprodução", command=stop_play).grid(row=2, column=1, padx=5, pady=5)
+    btn_start      = ttk.Button(frame, text="Iniciar Gravação",  command=lambda: start_record(update_label))
+    btn_stop       = ttk.Button(frame, text="Parar Gravação",    command=stop_record)
+    btn_load_macro = ttk.Button(frame, text="Carregar Macro",    command=load_macro_file)
+    btn_play       = ttk.Button(frame, text="Iniciar Reprodução",command=play_macro)
+    btn_stop_play  = ttk.Button(frame, text="Parar Reprodução",  command=stop_play)
+
+    btn_start.grid     (row=0, column=0, padx=5, pady=5)
+    btn_stop.grid      (row=0, column=1, padx=5, pady=5)
+    btn_load_macro.grid(row=1, column=0, padx=5, pady=5)
+    btn_play.grid      (row=1, column=1, padx=5, pady=5)
+    btn_stop_play.grid (row=2, column=1, padx=5, pady=5)
 
     label_count  = ttk.Label(frame, text=f"Próximo reset em: {segment_time}s")
-    label_count.grid(row=2, column=0, pady=(10,0))
+    label_count.grid   (row=2, column=0, pady=(10,0))
     label_loaded = ttk.Label(frame, text="Nenhum macro carregado")
-    label_loaded.grid(row=3, column=0, columnspan=2, pady=(5,0))
+    label_loaded.grid  (row=3, column=0, columnspan=2, pady=(5,0))
 
     def update_label(remaining):
         label_count.config(text=f"Próximo reset em: {remaining}s")
 
+    keyboard.add_hotkey(config["record_start_hotkey"], lambda: start_record(update_label))
+    keyboard.add_hotkey(config["record_stop_hotkey"],  stop_record)
+    keyboard.add_hotkey(config["play_start_hotkey"],   play_macro)
+    keyboard.add_hotkey(config["play_stop_hotkey"],    stop_play)
+
     root.mainloop()
 else:
-    # autoplay: inicia reprodução automaticamente e mantém o processo vivo
+    # sem GUI em autoplay: inicia reprodução automaticamente
     threading.Timer(0.5, play_macro).start()
+    # mantém o processo vivo até o execv
     while True:
-        time.sleep(1)
+        time.sleep(1)                                                                  
