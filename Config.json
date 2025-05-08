@@ -4,5 +4,5 @@
     "play_start_hotkey": "F8",
     "play_stop_hotkey": "F12",
     "auto_reset_time": 130,
-    "mouse_sensitivity": 10.0
+    "mouse_sensitivity": 1.0
 }

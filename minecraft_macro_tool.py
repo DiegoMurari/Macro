@@ -8,184 +8,61 @@ import json
 import threading
 import keyboard
 import ctypes
-from ctypes import byref, sizeof, wintypes
+from ctypes import byref, sizeof, wintypes, c_uint
+from pynput import mouse
+from pynput.mouse import Controller, Button
 import tkinter as tk
 from tkinter import ttk, filedialog
 
-# -- WinAPI & ctypes setup ---------------------------------------------------
+# parameters from config.json will still be loaded, but GUI is skipped in autoplay:
+AUTO_LOOP = "--autoplay" in sys.argv
 
+def _do_exec_autoplay():
+    python = sys.executable
+    script = os.path.abspath(sys.argv[0])
+    os.execv(python, [python, script, "--autoplay"])
+
+# WinAPI for playback
 user32   = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
-# CreateWindowExW signature (64-bit hInstance/lpParam)
-user32.CreateWindowExW.argtypes = [
-    wintypes.DWORD,    # dwExStyle
-    ctypes.c_wchar_p,  # lpClassName
-    ctypes.c_wchar_p,  # lpWindowName
-    wintypes.DWORD,    # dwStyle
-    ctypes.c_int,      # X
-    ctypes.c_int,      # Y
-    ctypes.c_int,      # nWidth
-    ctypes.c_int,      # nHeight
-    wintypes.HWND,     # hWndParent
-    wintypes.HMENU,    # hMenu
-    ctypes.c_void_p,   # hInstance
-    ctypes.c_void_p    # lpParam
-]
-user32.CreateWindowExW.restype = wintypes.HWND
-
-# DefWindowProcW signature (64-bit wParam/lParam)
-user32.DefWindowProcW.argtypes = [
-    ctypes.c_void_p,  # hWnd
-    wintypes.UINT,    # Msg
-    ctypes.c_void_p,  # wParam
-    ctypes.c_void_p   # lParam
-]
-user32.DefWindowProcW.restype = ctypes.c_long
-
-# Window procedure prototype
-WNDPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_long,
-    ctypes.c_void_p,  # hWnd
-    ctypes.c_uint,    # Msg
-    ctypes.c_void_p,  # wParam
-    ctypes.c_void_p   # lParam
-)
-
-# Structures for Raw Input
-class WNDCLASS(ctypes.Structure):
-    _fields_ = [
-        ("style", ctypes.c_uint),
-        ("lpfnWndProc", WNDPROC),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", ctypes.c_void_p),
-        ("hIcon", ctypes.c_void_p),
-        ("hCursor", ctypes.c_void_p),
-        ("hbrBackground", ctypes.c_void_p),
-        ("lpszMenuName", ctypes.c_wchar_p),
-        ("lpszClassName", ctypes.c_wchar_p),
-    ]
-
-class RAWINPUTDEVICE(ctypes.Structure):
-    _fields_ = [
-        ("usUsagePage", ctypes.c_ushort),
-        ("usUsage", ctypes.c_ushort),
-        ("dwFlags", ctypes.c_uint),
-        ("hwndTarget", ctypes.c_void_p),
-    ]
-
-class RAWINPUTHEADER(ctypes.Structure):
-    _fields_ = [
-        ("dwType", ctypes.c_uint),
-        ("dwSize", ctypes.c_uint),
-        ("hDevice", ctypes.c_void_p),
-        ("wParam", ctypes.c_ulong),
-    ]
-
-class RAWMOUSE(ctypes.Structure):
-    _fields_ = [
-        ("usFlags", ctypes.c_ushort),
-        ("ulButtons", ctypes.c_uint),
-        ("usButtonFlags", ctypes.c_ushort),
-        ("usButtonData", ctypes.c_ushort),
-        ("ulRawButtons", ctypes.c_uint),
-        ("lLastX", ctypes.c_long),
-        ("lLastY", ctypes.c_long),
-        ("ulExtraInformation", ctypes.c_uint),
-    ]
-
-class RAWINPUT_UNION(ctypes.Union):
-    _fields_ = [("mouse", RAWMOUSE)]
-
-class RAWINPUT(ctypes.Structure):
-    _fields_ = [
-        ("header", RAWINPUTHEADER),
-        ("data", RAWINPUT_UNION),
-    ]
-
-# -- Raw Input Recorder -------------------------------------------------------
-
+# -- Raw Input Recorder via pynput -------------------------------------------
 class RawInputRecorder:
-    RIDEV_INPUTSINK = 0x00000100
-    WM_INPUT        = 0x00FF
-
+    """
+    Captura dx/dy globalmente usando pynput.
+    on_move(dx, dy) chamado a cada evento de movimento.
+    """
     def __init__(self):
-        self.hwnd     = None
-        self.thread   = None
-        self.running  = False
-        self.callback = None
+        self._listener = None
+        self._last_pos = None
 
     def start(self, on_move):
-        """Begin capturing raw mouse movement; on_move(dx, dy) called each event."""
-        self.callback = on_move
-        self.running  = True
-        self.thread   = threading.Thread(target=self._message_loop, daemon=True)
-        self.thread.start()
+        if self._listener:
+            return
+        self._last_pos = None
+
+        def _on_move(x, y):
+            if self._last_pos is None:
+                self._last_pos = (x, y)
+                return
+            dx = x - self._last_pos[0]
+            dy = y - self._last_pos[1]
+            self._last_pos = (x, y)
+            if dx or dy:
+                on_move(dx, dy)
+
+        self._listener = mouse.Listener(on_move=_on_move)
+        self._listener.start()
+        print("[RawInput] Listener pynput iniciado", flush=True)
 
     def stop(self):
-        """Stop capturing and destroy the hidden window."""
-        self.running = False
-        if self.hwnd:
-            user32.DestroyWindow(self.hwnd)
-            self.hwnd = None
-
-    def _message_loop(self):
-        def wnd_proc(hwnd, msg, wparam, lparam):
-            if msg == RawInputRecorder.WM_INPUT:
-                size = ctypes.c_uint(0)
-                user32.GetRawInputData(
-                    lparam, 0x10000003, None, byref(size), sizeof(RAWINPUTHEADER)
-                )
-                buf = ctypes.create_string_buffer(size.value)
-                user32.GetRawInputData(
-                    lparam, 0x10000003, buf, byref(size), sizeof(RAWINPUTHEADER)
-                )
-                raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
-                if raw.header.dwType == 0:  # MOUSE
-                    dx = raw.data.mouse.lLastX
-                    dy = raw.data.mouse.lLastY
-                    if self.callback:
-                        self.callback(dx, dy)
-            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-        proc = WNDPROC(wnd_proc)
-        wc   = WNDCLASS()
-        wc.style         = 0
-        wc.lpfnWndProc   = proc
-        wc.cbClsExtra    = wc.cbWndExtra = 0
-        wc.hInstance     = kernel32.GetModuleHandleW(None)
-        wc.hIcon = wc.hCursor = wc.hbrBackground = None
-        wc.lpszMenuName  = None
-        wc.lpszClassName = "RawInputListener"
-        user32.RegisterClassW(byref(wc))
-
-        self.hwnd = user32.CreateWindowExW(
-            0,
-            wc.lpszClassName,
-            wc.lpszClassName,
-            0, 0, 0, 0, 0,
-            None, None,
-            wc.hInstance,
-            None
-        )
-
-        rid = RAWINPUTDEVICE(
-            usUsagePage=1, usUsage=2,
-            dwFlags=RawInputRecorder.RIDEV_INPUTSINK,
-            hwndTarget=self.hwnd
-        )
-        user32.RegisterRawInputDevices((RAWINPUTDEVICE * 1)(rid), 1, sizeof(RAWINPUTDEVICE))
-
-        msg = wintypes.MSG()
-        PM_REMOVE = 0x0001
-        while self.running:
-            if user32.PeekMessageW(byref(msg), self.hwnd, 0, 0, PM_REMOVE):
-                user32.TranslateMessage(byref(msg))
-                user32.DispatchMessageW(byref(msg))
+        if self._listener:
+            self._listener.stop()
+            self._listener = None
+            self._last_pos = None
+            print("[RawInput] Listener pynput parado", flush=True)
 
 # -- Globals ------------------------------------------------------------------
-
 events            = []
 recording         = False
 playing           = False
@@ -195,7 +72,6 @@ segment_end_time  = 0
 loaded_macro_file = None
 
 # -- Configuration -----------------------------------------------------------
-
 def load_config():
     default = {
         "record_start_hotkey": "F9",
@@ -220,11 +96,10 @@ def load_config():
         return default
 
 config            = load_config()
-segment_time      = config.get("auto_reset_time", 130)
-mouse_sensitivity = config.get("mouse_sensitivity", 10.0)
+segment_time      = config["auto_reset_time"]
+mouse_sensitivity = config["mouse_sensitivity"]
 
 # -- Recording & Segmentation ------------------------------------------------
-
 def on_key_event(event):
     if recording and event.event_type in ("down", "up"):
         events.append({
@@ -267,7 +142,7 @@ def auto_reset_script():
     keyboard.write("/mina reset"); keyboard.send("enter")
     time.sleep(0.1)
     print("Enviado /mina reset. Reiniciando script...", flush=True)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    _do_exec_autoplay()
 
 def on_segment():
     if recording:
@@ -294,16 +169,13 @@ def stop_record():
     if not recording:
         return
     recording = False
-    if raw_recorder:
-        raw_recorder.stop()
+    raw_recorder.stop()
     keyboard.unhook(on_key_event)
-    if segment_timer:
-        segment_timer.cancel()
-    save_macro()  # always save on stop
+    segment_timer.cancel()
+    save_macro()
     print(f"Gravação parada. {len(events)} eventos registrados e salvos.", flush=True)
 
 # -- Macro Loading -----------------------------------------------------------
-
 def load_macro_file():
     global loaded_macro_file
     fname = filedialog.askopenfilename(
@@ -314,92 +186,108 @@ def load_macro_file():
     if fname:
         loaded_macro_file = fname
         print(f"Macro carregada: {fname}", flush=True)
-        label_loaded.config(text=os.path.basename(fname))
+
+# -- Periodic Actions --------------------------------------------------------
+def _periodic_actions():
+    mouse_ctrl = Controller()
+    mouse_ctrl.press(Button.left)
+    try:
+        while playing:
+            time.sleep(10)
+            dx = int(180 * mouse_sensitivity)
+            user32.mouse_event(0x0001, dx, 0, 0, 0)
+            keyboard.press('3'); keyboard.release('3')
+    finally:
+        mouse_ctrl.release(Button.left)
 
 # -- Playback -----------------------------------------------------------------
-
 def _play_thread(macro_events):
-    start_offset = time.time() - macro_events[0]["time"]
+    global playing
+    keyboard.block_key('esc')
+
+    record_start = macro_events[0]["time"]
+    play_start   = time.time()
+    threading.Thread(target=_periodic_actions, daemon=True).start()
+
     for e in macro_events:
         if not playing:
             break
-        wait = e["time"] + start_offset - time.time()
+        wait = (play_start + (e["time"] - record_start)) - time.time()
         if wait > 0:
             time.sleep(wait)
-        if e.get("type") == "mouse":
-            dx = int(e["dx"] * mouse_sensitivity)
-            dy = -int(e["dy"] * mouse_sensitivity)
-            user32.mouse_event(0x0001, dx, dy, 0, 0)
-        elif e.get("type") == "key":
-            et = e.get("event_type"); sc = e.get("scan_code")
-            if et == "down":
-                keyboard.press(sc)
-            elif et == "up":
-                keyboard.release(sc)
-    print("Reprodução concluída." if playing else "Reprodução interrompida.", flush=True)
+        if e["type"] == "mouse":
+            user32.mouse_event(0x0001, int(e["dx"]), -int(e["dy"]), 0, 0)
+        else:
+            if e["event_type"] == "down":
+                keyboard.press(e["scan_code"])
+            else:
+                keyboard.release(e["scan_code"])
+
+    print("Reprodução concluída.", flush=True)
+    keyboard.send("t"); time.sleep(0.1)
+    keyboard.write("/mina reset"); keyboard.send("enter")
+    time.sleep(0.1)
+    keyboard.unblock_key('esc')
+    playing = False
+    _do_exec_autoplay()
 
 def play_macro():
     global playing
-    if recording:
-        print("Pare a gravação antes de reproduzir.", flush=True)
-        return
-    if playing:
+    if recording or playing:
         return
     if loaded_macro_file:
         fname = loaded_macro_file
     else:
         files = [f for f in os.listdir() if f.startswith("mineracao") and f.endswith(".json")]
-        if not files:
-            print("Nenhum macro encontrado.", flush=True)
-            return
         files.sort(key=lambda f: int(f[len("mineracao"):-5]))
-        fname = files[-1]
+        fname = files[-1] if files else None
+    if not fname:
+        print("Nenhum macro encontrado.", flush=True)
+        return
     with open(fname, "r", encoding="utf-8") as f:
-        macro = json.load(f)
+        macro_events = json.load(f)
     playing = True
-    threading.Thread(target=_play_thread, args=(macro,), daemon=True).start()
+    threading.Thread(target=_play_thread, args=(macro_events,), daemon=True).start()
     print(f"Reproduzindo {fname}...", flush=True)
 
 def stop_play():
     global playing
     if playing:
         playing = False
-        print("Reprodução parada.", flush=True)
+        print("Reprodução parada pelo usuário.", flush=True)
 
-# -- GUI ----------------------------------------------------------------------
+# ─── Registra hotkeys SEMPRE ─────────────────────────────────────────────────
+keyboard.add_hotkey(config["record_start_hotkey"], lambda: start_record(lambda r: None))
+keyboard.add_hotkey(config["record_stop_hotkey"],  stop_record)
+keyboard.add_hotkey(config["play_start_hotkey"],   play_macro)
+keyboard.add_hotkey(config["play_stop_hotkey"],    stop_play)
 
-root = tk.Tk()
-root.title("Minecraft Macro Tool")
-root.resizable(False, False)
+# ─── GUI (só se não for autoplay) ────────────────────────────────────────────
+if not AUTO_LOOP:
+    root = tk.Tk()
+    root.title("Minecraft Macro Tool")
+    root.resizable(False, False)
 
-frame = ttk.Frame(root, padding=10)
-frame.grid()
+    frame = ttk.Frame(root, padding=10)
+    frame.grid()
 
-btn_start      = ttk.Button(frame, text="Iniciar Gravação",     command=lambda: start_record(update_label))
-btn_stop       = ttk.Button(frame, text="Parar Gravação",        command=stop_record)
-btn_load_macro = ttk.Button(frame, text="Carregar Macro",        command=load_macro_file)
-btn_play       = ttk.Button(frame, text="Iniciar Reprodução",    command=play_macro)
-btn_stop_play  = ttk.Button(frame, text="Parar Reprodução",      command=stop_play)
+    ttk.Button(frame, text="Iniciar Gravação", command=lambda: start_record(update_label)).grid(row=0, column=0, padx=5, pady=5)
+    ttk.Button(frame, text="Parar Gravação",  command=stop_record).grid(row=0, column=1, padx=5, pady=5)
+    ttk.Button(frame, text="Carregar Macro",  command=load_macro_file).grid(row=1, column=0, padx=5, pady=5)
+    ttk.Button(frame, text="Iniciar Reprodução", command=play_macro).grid(row=1, column=1, padx=5, pady=5)
+    ttk.Button(frame, text="Parar Reprodução", command=stop_play).grid(row=2, column=1, padx=5, pady=5)
 
-btn_start.grid     (row=0, column=0, padx=5, pady=5)
-btn_stop.grid      (row=0, column=1, padx=5, pady=5)
-btn_load_macro.grid(row=1, column=0, padx=5, pady=5)
-btn_play.grid      (row=1, column=1, padx=5, pady=5)
-btn_stop_play.grid (row=2, column=1, padx=5, pady=5)
+    label_count  = ttk.Label(frame, text=f"Próximo reset em: {segment_time}s")
+    label_count.grid(row=2, column=0, pady=(10,0))
+    label_loaded = ttk.Label(frame, text="Nenhum macro carregado")
+    label_loaded.grid(row=3, column=0, columnspan=2, pady=(5,0))
 
-label_count  = ttk.Label(frame, text=f"Próximo reset em: {segment_time}s")
-label_count.grid   (row=2, column=0, pady=(10,0))
+    def update_label(remaining):
+        label_count.config(text=f"Próximo reset em: {remaining}s")
 
-label_loaded = ttk.Label(frame, text="Nenhum macro carregado")
-label_loaded.grid  (row=3, column=0, columnspan=2, pady=(5,0))
-
-def update_label(remaining):
-    label_count.config(text=f"Próximo reset em: {remaining}s")
-
-# Hotkeys (work even when GUI is open)
-keyboard.add_hotkey(config["record_start_hotkey"], lambda: start_record(update_label))
-keyboard.add_hotkey(config["record_stop_hotkey"], stop_record)
-keyboard.add_hotkey(config["play_start_hotkey"], play_macro)
-keyboard.add_hotkey(config["play_stop_hotkey"], stop_play)
-
-root.mainloop()
+    root.mainloop()
+else:
+    # autoplay: inicia reprodução automaticamente e mantém o processo vivo
+    threading.Timer(0.5, play_macro).start()
+    while True:
+        time.sleep(1)
